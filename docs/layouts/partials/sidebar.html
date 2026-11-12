@@ -1,0 +1,20 @@
+{{$currentPage := .}}
+<aside class="col-sm-3 sidebar sidebar-line">
+
+  <ul class="nav sidenav dropable ">
+    {{range .Site.Sections}}
+    {{$section := .}}
+    <li>
+      <a class="{{if eq $currentPage.Permalink .Permalink}} active{{end}}" href="{{.Permalink}}">{{.Title}}</a>
+      {{if and .Pages (hasPrefix $currentPage.Permalink $section.Permalink)}}
+      <ul class="open">
+      {{range .Pages}}
+        <li><a{{if eq $currentPage.Permalink .Permalink}} class="active"{{end}} href="{{.Permalink}}">{{.Title}}</a></li>
+      {{end}}
+      </ul>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+
+</aside>

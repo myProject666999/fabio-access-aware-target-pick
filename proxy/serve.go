@@ -1,0 +1,220 @@
+package proxy
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"log"
+	"maps"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+
+	"github.com/fabiolb/fabio/config"
+	"github.com/fabiolb/fabio/proxy/tcp"
+
+	"github.com/inetaf/tcpproxy"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+type Server interface {
+	Close() error
+	Serve(l net.Listener) error
+	Shutdown(ctx context.Context) error
+}
+
+var (
+	// mu guards servers which contains the list
+	// of running proxy servers.
+	mu      sync.Mutex
+	servers = make(map[string]Server)
+)
+
+func CloseProxy(address string) error {
+	mu.Lock()
+	if srv, ok := servers[address]; ok {
+		err := srv.Close()
+		if err != nil {
+			return err
+		}
+		log.Printf("[INFO] Dynamic TCP listener on %s has been terminated", address)
+		delete(servers, address)
+	}
+	mu.Unlock()
+	return nil
+}
+
+func Close() {
+	mu.Lock()
+	for _, srv := range servers {
+		srv.Close()
+	}
+	servers = make(map[string]Server)
+	mu.Unlock()
+}
+
+func Shutdown(timeout time.Duration) {
+	mu.Lock()
+	srvs := make(map[string]Server, len(servers))
+	maps.Copy(srvs, servers)
+	servers = make(map[string]Server)
+	mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, srv := range srvs {
+		wg.Add(1)
+		go func(srv Server) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			srv.Shutdown(ctx)
+		}(srv)
+	}
+	wg.Wait()
+}
+
+func ListenAndServeHTTP(l config.Listen, h http.Handler, cfg *tls.Config) error {
+	ln, err := ListenTCP(l, cfg)
+	if err != nil {
+		return err
+	}
+
+	srv := &http.Server{
+		Addr:         l.Addr,
+		Handler:      h,
+		ReadTimeout:  l.ReadTimeout,
+		WriteTimeout: l.WriteTimeout,
+		IdleTimeout:  l.IdleTimeout,
+		TLSConfig:    cfg,
+	}
+	return serve(ln, srv)
+}
+
+func ListenAndServePrometheus(l config.Listen, pcfg config.Prometheus, cfg *tls.Config) error {
+	ln, err := ListenTCP(l, cfg)
+	if err != nil {
+		return err
+	}
+	mux := http.NewServeMux()
+	if pcfg.Path != "/" {
+		mux.HandleFunc("/", func(rw http.ResponseWriter, _ *http.Request) {
+			rw.Header().Set("Location", pcfg.Path)
+			rw.WriteHeader(http.StatusPermanentRedirect)
+		})
+	}
+	mux.Handle(pcfg.Path, promhttp.Handler())
+
+	srv := &http.Server{
+		Addr:         l.Addr,
+		Handler:      mux,
+		ReadTimeout:  l.ReadTimeout,
+		WriteTimeout: l.WriteTimeout,
+		IdleTimeout:  l.IdleTimeout,
+		TLSConfig:    cfg,
+	}
+	return serve(ln, srv)
+}
+
+func ListenAndServeHTTPSTCPSNI(l config.Listen, h http.Handler, p tcp.Handler, cfg *tls.Config, m tcpproxy.Matcher) error {
+	// PROXY protocol must be consumed before tcpproxy inspects the TLS
+	// ClientHello for SNI routing. ListenTCP applies the configured wrapper to
+	// the listener before tcpproxy sees any connections.
+	tp := &tcpproxy.Proxy{
+		ListenFunc: func(net, laddr string) (net.Listener, error) {
+			// cfg is nil here so it's not terminating TLS (yet)
+			return ListenTCP(l, nil)
+		},
+	}
+
+	// This inspects SNI for matches.  If this succeeds then we Proxy tcp.
+	tcpSNIListener := &tcpproxy.TargetListener{Address: l.Addr}
+	tp.AddSNIMatchRoute(l.Addr, m, tcpSNIListener)
+
+	// Fallthrough to https
+	httpsListener := &tcpproxy.TargetListener{Address: l.Addr}
+	tp.AddRoute(l.Addr, httpsListener)
+
+	// Start the listener
+	err := tp.Start()
+	if err != nil {
+		return err
+	}
+
+	tps := &InetAfTCPProxyServer{Proxy: tp}
+	tps.ServeLater(tcpSNIListener, &tcp.Server{
+		Addr:         l.Addr,
+		Handler:      p,
+		ReadTimeout:  l.ReadTimeout,
+		WriteTimeout: l.WriteTimeout,
+	})
+
+	// wrap TargetListener in a tls terminating version for HTTPS
+	tps.ServeLater(tls.NewListener(httpsListener, cfg), &http.Server{
+		Addr:         l.Addr,
+		Handler:      h,
+		ReadTimeout:  l.ReadTimeout,
+		WriteTimeout: l.WriteTimeout,
+		IdleTimeout:  l.IdleTimeout,
+		TLSConfig:    cfg,
+	})
+
+	// tcpproxy creates its own listener from the configuration above so we can
+	// safely pass nil here, nonetheless we are passing `httpsListener` to
+	// extract it's address and save server in the `servers` map.
+	return serve(httpsListener, tps)
+}
+
+func ListenAndServeGRPC(l config.Listen, opts []grpc.ServerOption, cfg *tls.Config) error {
+	ln, err := ListenTCP(l, cfg)
+	if err != nil {
+		return err
+	}
+
+	srv := &gRPCServer{
+		server: grpc.NewServer(opts...),
+	}
+
+	return serve(ln, srv)
+}
+
+func ListenAndServeTCP(l config.Listen, h tcp.Handler, cfg *tls.Config) error {
+	ln, err := ListenTCP(l, cfg)
+	if err != nil {
+		return err
+	}
+
+	// If PROXY protocol is enabled and handler is a Proxy, set ListenAddr
+	if l.ProxyProto {
+		if proxy, ok := h.(*tcp.Proxy); ok {
+			proxy.ListenAddr = ln.Addr().String()
+		}
+	}
+
+	srv := &tcp.Server{
+		Addr:         l.Addr,
+		Handler:      h,
+		ReadTimeout:  l.ReadTimeout,
+		WriteTimeout: l.WriteTimeout,
+	}
+	return serve(ln, srv)
+}
+
+func serve(ln net.Listener, srv Server) error {
+	mu.Lock()
+	servers[ln.Addr().String()] = srv
+	mu.Unlock()
+	err := srv.Serve(ln)
+	if err != nil {
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		} else if opErr, ok := errors.AsType[*net.OpError](err); ok {
+			if opErr.Err != nil && opErr.Err.Error() == "use of closed network connection" {
+				err = nil
+			}
+		}
+	}
+	return err
+}
