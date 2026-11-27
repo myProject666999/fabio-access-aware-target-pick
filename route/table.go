@@ -484,7 +484,7 @@ func (t Table) Lookup(req *http.Request, pick picker, match matcher, globCache *
 
 	hosts = append(hosts, "")
 	for _, h := range hosts {
-		if target = t.lookup(h, req.URL.Path, pick, match); target != nil {
+		if target = t.lookup(h, req.URL.Path, req, pick, match); target != nil {
 			if target.RedirectCode != 0 {
 				req.URL.Host = req.Host
 				target.BuildRedirectURL(req.URL) // build redirect url and cache in target
@@ -503,25 +503,14 @@ func (t Table) Lookup(req *http.Request, pick picker, match matcher, globCache *
 }
 
 func (t Table) LookupHost(host string, pick picker) *Target {
-	return t.lookup(host, "/", pick, prefixMatcher)
+	return t.lookup(host, "/", nil, pick, prefixMatcher)
 }
 
-func (t Table) lookup(host, path string, pick picker, match matcher) *Target {
+func (t Table) lookup(host, path string, req *http.Request, pick picker, match matcher) *Target {
 	host = strings.ToLower(host) // routes are always added lowercase
 	for _, r := range t[host] {
 		if match(path, r) {
-			n := len(r.Targets)
-			if n == 0 {
-				return nil
-			}
-
-			var target *Target
-			if n == 1 {
-				target = r.Targets[0]
-			} else {
-				target = pick(r)
-			}
-			return target
+			return r.pickTarget(req, pick)
 		}
 	}
 	return nil

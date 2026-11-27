@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/fabiolb/fabio/transport"
 	"log"
+	"net/http"
 	"net/url"
 	"reflect"
 	"slices"
@@ -40,8 +41,14 @@ type Route struct {
 	wTargets []*Target
 
 	// total contains the total number of requests for this route.
-	// Used by the RRPicker
-	total uint64
+	// Used by the RRPicker. It is a pointer so that the filtered slot
+	// views created by pickTarget share the same counter with the route.
+	total *uint64
+
+	// hasAccessRules is true when at least one target carries access
+	// rules. It is recomputed by weighTargets after every mutation of
+	// Targets (addTarget, filter, setWeight).
+	hasAccessRules bool
 }
 
 func (r *Route) addTarget(service string, targetURL *url.URL, fixedWeight float64, tags []string, opts map[string]string) {
@@ -157,6 +164,76 @@ func contains(src, dst []string) bool {
 	return true
 }
 
+// pickTarget selects the target for a request.
+//
+// Routes without access rules take the original code path: a single target
+// is returned directly and everything else is delegated to the picker
+// unchanged.
+//
+// When at least one target carries access rules, targets whose rules deny
+// the request's source are excluded first and the picker runs on the
+// remaining slots of the original weighted ring, so the surviving targets
+// keep the slot ratios weighTargets gave them. If every target is excluded
+// the picker runs on the unfiltered ring: Lookup still returns a target
+// (instead of falling through to less specific host patterns or the
+// hostless catch-all route) and the caller's AccessDeniedHTTP check turns
+// the response into a 403.
+//
+// req may be nil (LookupHost) in which case no filtering takes place.
+func (r *Route) pickTarget(req *http.Request, pick picker) *Target {
+	n := len(r.Targets)
+	switch {
+	case n == 0:
+		return nil
+	case n == 1:
+		return r.Targets[0]
+	case !r.hasAccessRules || req == nil:
+		return pick(r)
+	}
+
+	// evaluate the access decision once per target, not once per slot
+	var deniedBuf [8]bool
+	denied := deniedBuf[:]
+	if n > len(deniedBuf) {
+		denied = make([]bool, n)
+	} else {
+		denied = denied[:n]
+	}
+	anyDenied := false
+	for i, t := range r.Targets {
+		if d, _ := t.checkAccessHTTP(req); d {
+			denied[i] = true
+			anyDenied = true
+		}
+	}
+	if !anyDenied {
+		return pick(r)
+	}
+
+	deniedTarget := make(map[*Target]bool, n)
+	for i, t := range r.Targets {
+		deniedTarget[t] = denied[i]
+	}
+
+	// keep only the slots of the surviving targets; the ratios between
+	// them stay exactly as weighTargets placed them on the ring
+	slots := make([]*Target, 0, len(r.wTargets))
+	for _, t := range r.wTargets {
+		if !deniedTarget[t] {
+			slots = append(slots, t)
+		}
+	}
+	if len(slots) == 0 {
+		return pick(r)
+	}
+
+	// run the picker on a filtered view of the ring; the view shares the
+	// rr counter with the route so that consecutive requests with the same
+	// candidate set rotate through all of its slots
+	sub := &Route{wTargets: slots, total: r.total}
+	return pick(sub)
+}
+
 func (r *Route) TargetConfig(t *Target, addWeight bool) string {
 	s := fmt.Sprintf("route add %s %s %s", t.Service, r.Host+r.Path, t.URL)
 	if addWeight {
@@ -211,6 +288,20 @@ const maxSlots = 1e4 // 10000
 // Targets with a dynamic weight will receive an equal share of the remaining
 // traffic if there is any left.
 func (r *Route) weighTargets() {
+	// lazily initialize the shared rr counter and recompute the access
+	// rule flag; weighTargets runs after every mutation of r.Targets, so
+	// nothing derived from the target set is ever stale
+	if r.total == nil {
+		r.total = new(uint64)
+	}
+	r.hasAccessRules = false
+	for _, t := range r.Targets {
+		if len(t.accessRules) > 0 {
+			r.hasAccessRules = true
+			break
+		}
+	}
+
 	// how big is the fixed weighted traffic?
 	var nFixed int
 	var sumFixed float64

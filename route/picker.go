@@ -22,9 +22,10 @@ func rndPicker(r *Route) *Target {
 
 // rrPicker picks the next target from a list of targets using round-robin.
 func rrPicker(r *Route) *Target {
-	u := r.wTargets[r.total%uint64(len(r.wTargets))]
-	atomic.AddUint64(&r.total, 1)
-	return u
+	// a single atomic op: reading r.total directly and incrementing it
+	// afterwards races with concurrent picks
+	n := atomic.AddUint64(r.total, 1) - 1
+	return r.wTargets[n%uint64(len(r.wTargets))]
 }
 
 // as it turns out, math/rand's Intn is now way faster (4x) than the previous implementation using

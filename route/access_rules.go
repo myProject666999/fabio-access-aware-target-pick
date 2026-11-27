@@ -16,26 +16,68 @@ const (
 
 // AccessDeniedHTTP checks rules on the target for HTTP proxy routes.
 func (t *Target) AccessDeniedHTTP(r *http.Request) bool {
-	// No rules ... skip checks
+	denied, ip := t.checkAccessHTTP(r)
+	if denied {
+		log.Printf("[INFO] route rules denied access from %s to %s",
+			ip.String(), t.URL.String())
+		return true
+	}
+
+	// The request is allowed. Keep emitting the diagnostics the previous
+	// implementation logged for unparseable source addresses.
 	if len(t.accessRules) == 0 {
 		return false
 	}
-
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		log.Printf("[ERROR] failed to get host from remote header %s: %s",
 			r.RemoteAddr, err.Error())
 		return false
 	}
-
-	ip := net.ParseIP(host)
-	if ip == nil {
+	if net.ParseIP(host) == nil {
 		log.Printf("[WARN] failed to parse remote address %s", host)
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		for xip := range strings.SplitSeq(xff, ",") {
+			xip = strings.TrimSpace(xip)
+			if xip == host {
+				continue
+			}
+			if net.ParseIP(xip) == nil {
+				log.Printf("[WARN] failed to parse xff address %s", xip)
+			}
+		}
+	}
+	return false
+}
+
+// checkAccessHTTP is the single, log-free copy of the HTTP access decision.
+// It reports whether the target's access rules deny the request and, if so,
+// which source IP triggered the denial. The decision is shared by
+// AccessDeniedHTTP - which adds the logging - and by the access-aware
+// target selection in Route.pickTarget, which must not emit denial logs
+// for requests that are eventually served by another target.
+//
+// The semantics are exactly those AccessDeniedHTTP always had: the remote
+// address and every element of X-Forwarded-For must pass, elements equal
+// to the remote host are skipped, unparseable elements are skipped and an
+// unparseable RemoteAddr (e.g. missing port, or none at all as with gRPC)
+// allows the request.
+func (t *Target) checkAccessHTTP(r *http.Request) (denied bool, ip net.IP) {
+	// No rules ... skip checks
+	if len(t.accessRules) == 0 {
+		return false, nil
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// unparseable remote address: allow
+		return false, nil
 	}
 
 	// check remote source and return if denied
-	if t.denyByIP(ip) {
-		return true
+	if ip = net.ParseIP(host); ip != nil && t.checkIPRules(ip) {
+		return true, ip
 	}
 
 	// check xff source if present
@@ -53,17 +95,16 @@ func (t *Target) AccessDeniedHTTP(r *http.Request) bool {
 				continue
 			}
 			if ip = net.ParseIP(xip); ip == nil {
-				log.Printf("[WARN] failed to parse xff address %s", xip)
 				continue
 			}
-			if t.denyByIP(ip) {
-				return true
+			if t.checkIPRules(ip) {
+				return true, ip
 			}
 		}
 	}
 
 	// default allow
-	return false
+	return false, nil
 }
 
 // AccessDeniedTCP checks rules on the target for TCP proxy routes.
@@ -90,55 +131,46 @@ func (t *Target) AccessDeniedTCP(c net.Conn) bool {
 }
 
 func (t *Target) denyByIP(ip net.IP) bool {
+	denied := t.checkIPRules(ip)
+	if denied {
+		log.Printf("[INFO] route rules denied access from %s to %s",
+			ip.String(), t.URL.String())
+	}
+	return denied
+}
+
+// checkIPRules reports whether ip is denied by the target's access rules.
+// It is the log-free core of denyByIP so that the decision can also be
+// used by checkAccessHTTP where logging is not wanted.
+func (t *Target) checkIPRules(ip net.IP) bool {
 	if ip == nil || len(t.accessRules) == 0 {
 		return false
 	}
 	// check allow (whitelist) first if it exists
-	if _, ok := t.accessRules[ipAllowTag]; ok {
-		var block *net.IPNet
-		for _, x := range t.accessRules[ipAllowTag] {
-			if block, ok = x.(*net.IPNet); !ok {
-				log.Printf("[ERROR] failed to assert ip block while checking allow rule for %s", t.Service)
+	if blocks, ok := t.accessRules[ipAllowTag]; ok {
+		for _, x := range blocks {
+			if block, ok := x.(*net.IPNet); !ok {
 				continue
-			}
-			// debug logging
-			log.Printf("[DEBUG] checking %s against ip allow rule %s", ip.String(), block.String())
-			// check block
-			if block.Contains(ip) {
-				// debug logging
-				log.Printf("[DEBUG] allowing request from %s via %s", ip.String(), block.String())
+			} else if block.Contains(ip) {
 				// specific allow matched - allow this request
 				return false
 			}
 		}
 		// we checked all the blocks - deny this request
-		log.Printf("[INFO] route rules denied access from %s to %s",
-			ip.String(), t.URL.String())
 		return true
 	}
 
 	// still going - check deny (blacklist) if it exists
-	if _, ok := t.accessRules[ipDenyTag]; ok {
-		var block *net.IPNet
-		for _, x := range t.accessRules[ipDenyTag] {
-			if block, ok = x.(*net.IPNet); !ok {
-				log.Printf("[INFO] failed to assert ip block while checking deny rule for %s", t.Service)
+	if blocks, ok := t.accessRules[ipDenyTag]; ok {
+		for _, x := range blocks {
+			if block, ok := x.(*net.IPNet); !ok {
 				continue
-			}
-			// debug logging
-			log.Printf("[DEBUG] checking %s against ip deny rule %s", ip.String(), block.String())
-			// check block
-			if block.Contains(ip) {
+			} else if block.Contains(ip) {
 				// specific deny matched - deny this request
-				log.Printf("[INFO] route rules denied access from %s to %s",
-					ip.String(), t.URL.String())
 				return true
 			}
 		}
 	}
-
-	// debug logging
-	log.Printf("[DEBUG] default allowing request from %s that was not denied", ip.String())
 
 	// default - do not deny
 	return false
